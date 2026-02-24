@@ -14,9 +14,13 @@
 %%% subject.
 %%%
 %%% This device runs on the first pass of the `compute' key call if executed
-%%% in a stack, and not in subsequent passes. Currently the device stores its
-%%% list of already seen items in memory, but at some point it will likely make
-%%% sense to drop them in the cache.
+%%% in a stack, and not in subsequent passes.
+%%%
+%%% When a viable store is configured in Opts, dedup state is stored as flat
+%%% LMDB key-value entries at `dedup/<ProcID>/<SubjectID>`. This is O(1) per
+%%% check/write and does not grow the M1 snapshot. When no store is available
+%%% (e.g., in unit tests), the device falls back to the legacy in-memory trie
+%%% stored under the `dedup' key in M1.
 -module(dev_dedup).
 -export([info/1]).
 -include_lib("eunit/include/eunit.hrl").
@@ -29,8 +33,7 @@ info(_M1) ->
     }.
 
 %% @doc Forward the keys and `set' functions to the message device, handle all
-%% others with deduplication. This allows the device to be used in any context
-%% where a key is called. If the `dedup-key
+%% others with deduplication.
 handle(<<"keys">>, M1, _M2, _Opts) ->
     dev_message:keys(M1);
 handle(<<"set">>, M1, M2, Opts) ->
@@ -38,8 +41,8 @@ handle(<<"set">>, M1, M2, Opts) ->
 handle(Key, M1, M2, Opts) ->
     ?event({dedup_handle, {key, Key}, {base, M1}, {req, M2}}),
     % Find the relevant parameters from the messages. We search for the
-    % `dedup-key' key in the first message, and use that value as the key to
-    % look for in the second message.
+    % `dedup-subject' key in the first message, and use that value as the key
+    % to look for in the second message.
     SubjectKey =
         hb_ao:get_first(
             [
@@ -67,14 +70,6 @@ handle(Key, M1, M2, Opts) ->
         end,
     % Is this the first pass, if we are executing in a stack?
     FirstPass = hb_ao:get(<<"pass">>, {as, <<"message@1.0">>, M1}, 1, Opts) == 1,
-    % Get the trie of already seen subjects.
-    DedupTrie =
-        hb_ao:get(
-            <<"dedup">>,
-            {as, <<"message@1.0">>, M1},
-            #{ <<"device">> => <<"trie@1.0">> },
-            Opts
-        ),
     ?event({dedup_handle,
         {key, Key},
         {base, M1},
@@ -92,45 +87,133 @@ handle(Key, M1, M2, Opts) ->
             % check.
             {ok, M1};
         {true, _} ->
-            % If this is the first pass, we need to check if the subject has
-            % already been seen.
             SubjectID = hb_message:id(Subject, signed, Opts),
-            ?event({dedup_checking, DedupTrie}),
-            case hb_ao:get(SubjectID, DedupTrie, Opts) of
-                not_found ->
-                    ?event({not_seen, SubjectID}),
-                    Slot =
-                        hb_maps:get(
-                            <<"slot">>,
-                            M2,
-                            true,
-                            Opts
-                        ),
-                    {ok, NewDedupTrie} =
-                        hb_ao:resolve(
-                            DedupTrie,
-                            #{ <<"path">> => <<"set">>, SubjectID => Slot },
-                            Opts
-                        ),
-                    ?event({dedup_updated, NewDedupTrie}),
-                    hb_ao:resolve(
-                        M1,
-                        #{ 
-                            <<"path">> => <<"set">>,
-                            <<"set-mode">> => <<"explicit">>,
-                            <<"dedup">> => NewDedupTrie
-                        },
-                        Opts
-                    );
-                Value ->
-                    ?event(
-                        {already_seen,
-                            {subject, SubjectID},
-                            {dedup_value, Value}
-                        }
-                    ),
-                    {skip, M1}
+            % Direct map lookup for the process key — see safe_proc_id/2 for
+            % why we cannot use hb_ao:get here.
+            RawProcess = maps:get(<<"process">>, M1, not_found),
+            Store = hb_opts:get(store, no_viable_store, Opts),
+            case {is_viable_store(Store), RawProcess} of
+                {_, not_found} ->
+                    % No stable process key: ProcID would change every slot.
+                    % Fall back to in-memory trie which lives inside M1.
+                    dedup_with_trie(SubjectID, M1, M2, Opts);
+                {false, _} ->
+                    % No viable store configured.
+                    dedup_with_trie(SubjectID, M1, M2, Opts);
+                {true, _} ->
+                    ProcID = safe_proc_id(RawProcess, Opts),
+                    DedupKey = dedup_key(ProcID, SubjectID, Store),
+                    dedup_with_store(DedupKey, SubjectID, M1, M2, Store, Opts)
             end
+    end.
+
+%% @doc Check whether a store value is viable (not a sentinel or empty list).
+is_viable_store(no_viable_store) -> false;
+is_viable_store([]) -> false;
+is_viable_store(_) -> true.
+
+%% @doc Compute the flat LMDB dedup key for a process/subject pair.
+dedup_key(ProcID, SubjectID, Store) ->
+    hb_store:path(Store, [<<"dedup">>, ProcID, SubjectID]).
+
+%% @doc Compute a stable ProcID from the raw value found at the `<<"process">>'
+%% key in M1.
+%%
+%% The caller must use `maps:get(<<"process">>, M1, ...)' directly — we cannot
+%% call `hb_ao:get(<<"process">>, M1, ...)' here because M1 may carry a
+%% `stack@1.0' device that includes `dev_dedup', which would re-enter
+%% `handle/4' and loop.  The `id' key is in our `exclude' list, so
+%% `hb_message:id' calls are safe even for stack messages.
+safe_proc_id(Process, Opts) when is_map(Process) ->
+    % Process is the signed process-definition sub-message; its device is
+    % not a stack containing dev_dedup, so hb_message:id is safe.
+    hb_message:id(Process, none, Opts);
+safe_proc_id(ProcBin, _Opts) when is_binary(ProcBin) ->
+    ProcBin.
+
+%% @doc Dedup using flat LMDB key-value storage (O(1) per check/write).
+%%
+%% M1 is NOT updated — dedup state lives only in the store, not in the process
+%% snapshot. On first-ever encounter the slot number is written at DedupKey.
+%% A migration fallback reads the old in-memory trie so that processes that
+%% already have a trie-based dedup snapshot continue to work correctly.
+dedup_with_store(DedupKey, SubjectID, M1, M2, Store, Opts) ->
+    case hb_store:read(Store, DedupKey) of
+        {ok, _} ->
+            ?event({already_seen_store, {subject, SubjectID}}),
+            {skip, M1};
+        _ ->
+            % not_found (or transient failure) — check migration trie fallback.
+            OldTrie =
+                hb_ao:get(
+                    <<"dedup">>,
+                    {as, <<"message@1.0">>, M1},
+                    not_found,
+                    Opts
+                ),
+            AlreadySeen =
+                case OldTrie of
+                    not_found -> false;
+                    T -> hb_ao:get(SubjectID, T, Opts) =/= not_found
+                end,
+            case AlreadySeen of
+                true ->
+                    {skip, M1};
+                false ->
+                    ?event({not_seen, SubjectID}),
+                    Slot = hb_maps:get(<<"slot">>, M2, true, Opts),
+                    hb_store:write(Store, DedupKey, hb_util:bin(Slot)),
+                    % M1 is intentionally NOT updated; dedup state is in the store.
+                    {ok, M1}
+            end
+    end.
+
+%% @doc Dedup using the legacy in-memory trie stored in M1 under `dedup'.
+%%
+%% Used as a fallback when no store is configured (e.g. unit tests).
+dedup_with_trie(SubjectID, M1, M2, Opts) ->
+    DedupTrie =
+        hb_ao:get(
+            <<"dedup">>,
+            {as, <<"message@1.0">>, M1},
+            #{ <<"device">> => <<"trie@1.0">> },
+            Opts
+        ),
+    ?event({dedup_checking, DedupTrie}),
+    case hb_ao:get(SubjectID, DedupTrie, Opts) of
+        not_found ->
+            ?event({not_seen, SubjectID}),
+            Slot =
+                hb_maps:get(
+                    <<"slot">>,
+                    M2,
+                    true,
+                    Opts
+                ),
+            {ok, NewDedupTrie} =
+                hb_ao:resolve(
+                    DedupTrie,
+                    #{ <<"path">> => <<"set">>, SubjectID => Slot },
+                    Opts
+                ),
+            ?event({dedup_updated, NewDedupTrie}),
+            hb_ao:resolve(
+                M1,
+                #{
+                    <<"path">> => <<"set">>,
+                    <<"set-mode">> => <<"explicit">>,
+                    <<"dedup">> => NewDedupTrie
+                },
+                Opts
+            );
+        Value ->
+            ?event(
+                {already_seen,
+                    {subject, SubjectID},
+                    {dedup_value, Value}
+                }
+            ),
+            {skip, M1}
     end.
 
 %%% Tests
@@ -168,7 +251,7 @@ dedup_test() ->
 
 dedup_with_multipass_test() ->
     % Create a stack with a dedup device and 2 devices that will append to a
-    % `Result' key and a `Multipass' device that will repeat the message for 
+    % `Result' key and a `Multipass' device that will repeat the message for
     % an additional pass. We want to ensure that Multipass is not hindered by
     % the dedup device.
 	Msg = #{

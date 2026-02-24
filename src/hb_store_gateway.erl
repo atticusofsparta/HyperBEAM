@@ -1,7 +1,7 @@
 %%% @doc A store module that reads data from the nodes Arweave gateway and 
 %%% GraphQL routes, additionally including additional store-specific routes.
 -module(hb_store_gateway).
--export([scope/1, type/2, read/2, resolve/2, list/2]).
+-export([scope/1, type/2, read/2, resolve/2, list/2, prefetch/3]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -68,7 +68,11 @@ read(BaseStoreOpts, Key) ->
                             not_found;
                         {ok, Message} ->
                             ?event({read_found, {key, ID}}),
-                            hb_store_remote_node:maybe_cache(StoreOpts, Message),
+                            % Pass ID as a link so the Arweave TX ID is indexed
+                            % in the local LMDB cache. Without this, every
+                            % subsequent lookup by the same TX ID would miss
+                            % and re-fetch from the gateway.
+                            hb_store_remote_node:maybe_cache(StoreOpts, Message, [ID]),
                             extract_path_value(Message, Rest, StoreOpts)
                     catch Class:Reason:Stacktrace ->
                         ?event(
@@ -136,6 +140,36 @@ opts(Opts) ->
                             }
                         ]
                     }
+            end
+    end.
+
+%% @doc Batch-fetch a list of IDs from the gateway and cache each result
+%% locally under both its HyperBEAM content hash and the original TX ID.
+%% IDs already present in the local cache are skipped. This lets callers
+%% warm the LMDB cache for a set of known IDs before resolving them
+%% individually, turning O(N) sequential gateway round-trips into O(1).
+prefetch(StoreOpts, IDs, Opts) ->
+    GWOpts = opts(StoreOpts),
+    Uncached = lists:filter(
+        fun(ID) ->
+            hb_store_remote_node:read_local_cache(StoreOpts, ID) =:= not_found
+        end,
+        IDs
+    ),
+    case Uncached of
+        [] -> ok;
+        _ ->
+            case hb_gateway_client:read_batch(Uncached, GWOpts) of
+                {error, _} -> ok;
+                {ok, Results} ->
+                    maps:foreach(
+                        fun(ID, {ok, Message}) ->
+                            hb_store_remote_node:maybe_cache(StoreOpts, Message, [ID]);
+                           (_, _) -> ok
+                        end,
+                        Results
+                    ),
+                    ok
             end
     end.
 

@@ -26,6 +26,28 @@ normalize(Msg, Opts) when is_map(Opts) ->
 normalize(Msg, false, _Opts) ->
     Msg;
 normalize(Msg, Mode, Opts) when is_map(Msg) ->
+    % Collect all lazy link IDs and batch-prefetch them from any gateway
+    % stores before resolving them sequentially below. This converts O(N)
+    % sequential gateway round-trips into a single batched query per
+    % gateway store.
+    LazyIDs =
+        [ID || {_, {link, ID, #{<<"lazy">> := true, <<"type">> := <<"link">>}}}
+               <- maps:to_list(Msg)],
+    case LazyIDs of
+        [_,_|_] ->
+            % Only worth batching when there are 2+ lazy links
+            lists:foreach(
+                fun(GWStore = #{<<"store-module">> := hb_store_gateway}) ->
+                    hb_store_gateway:prefetch(GWStore, LazyIDs, Opts);
+                   (_) -> ok
+                end,
+                case hb_opts:get(store, [], Opts) of
+                    S when is_list(S) -> S;
+                    S -> [S]
+                end
+            );
+        _ -> ok
+    end,
     maps:merge(
         maps:with([<<"commitments">>, <<"priv">>], Msg),
             maps:from_list(

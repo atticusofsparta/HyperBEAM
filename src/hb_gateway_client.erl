@@ -9,7 +9,7 @@
 -module(hb_gateway_client).
 %% Raw access primitives:
 -export([query/2, query/3, query/4, query/5]).
--export([read/2, data/2, result_to_message/2, item_spec/0]).
+-export([read/2, read_batch/2, data/2, result_to_message/2, item_spec/0]).
 %% Application-specific data access functions:
 -export([location/2]).
 -include_lib("include/hb.hrl").
@@ -76,6 +76,62 @@ read(ID, Opts) ->
                     ?event({read_found, {id, ID}, {item, Item}}),
                     result_to_message(ID, Item, Opts)
             end
+    end.
+
+%% @doc Fetch multiple data items by their IDs in a single GraphQL query.
+%% Returns {ok, #{BinaryID => {ok, Message}}} for all IDs found; IDs not
+%% found on the gateway are simply absent from the result map.
+%% Callers should chunk lists larger than ~100 IDs themselves.
+read_batch([], _Opts) ->
+    {ok, #{}};
+read_batch(IDs, Opts) ->
+    HumanIDs = [hb_util:human_id(ID) || ID <- IDs],
+    Limit = integer_to_binary(length(IDs)),
+    {Query, Variables} =
+        case maps:is_key(<<"subindex">>, Opts) of
+            true ->
+                Tags = subindex_to_tags(maps:get(<<"subindex">>, Opts)),
+                {
+                    <<"query($ids: [ID!]!) { transactions(ids: $ids, tags: ",
+                        Tags/binary,
+                        ", first: ", Limit/binary,
+                        ") { edges { ", (item_spec())/binary, " } } }">>,
+                    #{<<"ids">> => HumanIDs}
+                };
+            false ->
+                {
+                    <<"query($ids: [ID!]!) { transactions(ids: $ids, first: ",
+                        Limit/binary,
+                        ") { edges { ", (item_spec())/binary, " } } }">>,
+                    #{<<"ids">> => HumanIDs}
+                }
+        end,
+    case query(Query, Variables, Opts) of
+        {error, Reason} -> {error, Reason};
+        {ok, GqlMsg} ->
+            Edges = hb_ao:get(<<"data/transactions/edges">>, GqlMsg, [], Opts),
+            Results =
+                lists:foldl(
+                    fun(Edge, Acc) ->
+                        case hb_ao:get(<<"node">>, Edge, not_found, Opts) of
+                            not_found -> Acc;
+                            Item ->
+                                RawID = hb_maps:get(<<"id">>, Item, not_found, Opts),
+                                case RawID of
+                                    not_found -> Acc;
+                                    _ ->
+                                        BinID = hb_util:decode(RawID),
+                                        Acc#{BinID => result_to_message(BinID, Item, Opts)}
+                                end
+                        end
+                    end,
+                    #{},
+                    case Edges of
+                        L when is_list(L) -> L;
+                        _ -> []
+                    end
+                ),
+            {ok, Results}
     end.
 
 %% @doc Gives the fields of a transaction that are needed to construct an
