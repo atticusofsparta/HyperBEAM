@@ -427,7 +427,10 @@ do_import(Proc, CheckpointMessage, Opts) ->
         CheckpointSigners = hb_message:signers(CheckpointMessage, Opts),
         % Validate that the checkpoint message is signed by a trusted snapshot
         % authority, and targets this process.
-        TrustedSigners = hb_opts:get(genesis_wasm_import_authorities, [], Opts),
+        TrustedSigners = case hb_opts:get(genesis_wasm_import_authorities, [], Opts) of
+            M when is_map(M) -> maps:values(M);
+            L -> L
+        end,
         true ?=
             lists:any(
                 fun(Signer) -> lists:member(Signer, TrustedSigners) end,
