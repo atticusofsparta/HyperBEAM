@@ -244,7 +244,7 @@ maybe_set(Map1, Map2, Opts) ->
 cache_source_to_cache_settings({opts, Opts}, _) ->
     CCMap = specifiers_to_cache_settings(hb_opts:get(cache_control, [], Opts)),
     case hb_opts:get(hashpath, update, Opts) of
-        ignore -> CCMap#{ <<"store">> => false };
+        ignore -> CCMap#{ <<"store">> => false, <<"lookup">> => false };
         _ -> CCMap
     end;
 cache_source_to_cache_settings(Msg, Opts) ->
@@ -337,10 +337,12 @@ only_if_cached_directive_test() ->
     ).
 
 %% Test hashpath settings
-hashpath_ignore_prevents_storage_test() ->
+hashpath_ignore_prevents_storage_and_lookup_test() ->
+    % When hashpath => ignore, results cannot be stored (no valid hashpath key)
+    % and cache lookups are also skipped (results keyed by hashpath are invalid).
     Opts = (opts_with_cc([]))#{hashpath => ignore},
     Result = derive_cache_settings([], Opts),
-    ?assertEqual(#{<<"store">> => ?DEFAULT_STORE_OPT, <<"lookup">> => ?DEFAULT_LOOKUP_OPT}, Result).
+    ?assertEqual(#{<<"store">> => false, <<"lookup">> => false}, Result).
 
 %% Test multiple directives
 multiple_directives_test() ->

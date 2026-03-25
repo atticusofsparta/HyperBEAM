@@ -43,6 +43,7 @@
 -export([read/2, read_resolved/3, write/2, write_binary/3, write_hashpath/2, link/3]).
 -export([match/2, list/2, list_numbered/2]).
 -export([test_unsigned/1, test_signed/1]).
+-export([take_cache_stats/0]).
 -include("include/hb.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -272,10 +273,8 @@ write(Bin, Opts) when is_binary(Bin) ->
 
 do_write_message(Bin, Store, Opts) when is_binary(Bin) ->
     % Write the binary in the store at its calculated content-hash.
-    % Return the path.
     Path = generate_binary_path(Bin, Opts),
     hb_store:write(Store, Path, Bin),
-    %lists:map(fun(ID) -> hb_store:make_link(Store, Path, ID) end, AllIDs),
     {ok, Path};
 do_write_message(List, Store, Opts) when is_list(List) ->
     do_write_message(
@@ -289,8 +288,8 @@ do_write_message(Msg, Store, Opts) when is_map(Msg) ->
     UncommittedID = hb_message:id(Msg, none, Opts#{ linkify_mode => discard }),
     AllIDs = calculate_all_ids(Msg, Opts),
     AltIDs = AllIDs -- [UncommittedID],
-    MsgHashpathAlg = hb_path:hashpath_alg(Msg, Opts),
     ?event(debug_cache, {writing_message, {id, UncommittedID}, {alt_ids, AltIDs}, {original, Msg}}),
+    MsgHashpathAlg = hb_path:hashpath_alg(Msg, Opts),
     % Write all of the keys of the message into the store.
     hb_store:make_group(Store, UncommittedID),
     maps:map(
@@ -299,10 +298,9 @@ do_write_message(Msg, Store, Opts) when is_map(Msg) ->
         end,
         maps:without([<<"priv">>], Msg)
     ),
-    % Optionally store the message into the match index, if the index is configured.
+    % Optionally store the message into the match index, if configured.
     dev_match:write(AllIDs, Msg, Opts),
-    % Write the commitments to the store, linking each commitment ID to the
-    % uncommitted message.
+    % Link each commitment ID to the uncommitted message.
     lists:map(
         fun(AltID) ->
             ?event(debug_cache,
@@ -345,6 +343,27 @@ write_key(Base, <<"commitments">>, _HPAlg, RawCommitments, Store, Opts) ->
     ),
     % Link the commitments base to `base/commitments`.
     hb_store:make_link(Store, CommitmentsBase, <<Base/binary, "/commitments">>);
+%% @doc Timed write_key for the dedup trie — accumulates wall-time in the
+%% process dictionary so dev_process can report it per-slot.
+write_key(Base, <<"dedup">> = Key, HPAlg, Value, Store, Opts) ->
+    {Us, Result} = timer:tc(fun() ->
+        KeyHashPath = hb_path:hashpath(Base, hb_path:to_binary(Key), HPAlg, Opts),
+        {ok, Path} = do_write_message(Value, Store, Opts),
+        hb_store:make_link(Store, Path, KeyHashPath),
+        {ok, Path}
+    end),
+    cache_bump(dedup_write_us, Us),
+    Result;
+%% @doc Timed write_key for the balances map.
+write_key(Base, <<"balances">> = Key, HPAlg, Value, Store, Opts) ->
+    {Us, Result} = timer:tc(fun() ->
+        KeyHashPath = hb_path:hashpath(Base, hb_path:to_binary(Key), HPAlg, Opts),
+        {ok, Path} = do_write_message(Value, Store, Opts),
+        hb_store:make_link(Store, Path, KeyHashPath),
+        {ok, Path}
+    end),
+    cache_bump(balances_write_us, Us),
+    Result;
 write_key(Base, Key, HPAlg, Value, Store, Opts) ->
     KeyHashPath =
         hb_path:hashpath(
@@ -356,6 +375,25 @@ write_key(Base, Key, HPAlg, Value, Store, Opts) ->
     {ok, Path} = do_write_message(Value, Store, Opts),
     hb_store:make_link(Store, Path, KeyHashPath),
     {ok, Path}.
+
+%% @doc Accumulate a timing value in the calling process's dictionary.
+cache_bump(Key, N) ->
+    erlang:put(Key, case erlang:get(Key) of undefined -> N; V -> V + N end).
+
+%% @doc Read and reset a single cache timing accumulator.
+take_cache_stat(Key) ->
+    case erlang:get(Key) of
+        undefined -> 0;
+        V -> erlang:put(Key, 0), V
+    end.
+
+%% @doc Read and reset all per-slot cache timing stats. Called from dev_process
+%% after store_result to capture dedup and balances serialization times.
+take_cache_stats() ->
+    #{
+        dedup_write_us    => take_cache_stat(dedup_write_us),
+        balances_write_us => take_cache_stat(balances_write_us)
+    }.
 
 %% @doc The `structured@1.0` encoder does not typically encode `commitments`,
 %% subsequently, when we encounter a commitments message we prepare its contents
