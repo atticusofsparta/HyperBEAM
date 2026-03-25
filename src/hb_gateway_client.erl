@@ -244,8 +244,10 @@ result_to_message(ExpectedID, Item, Opts) ->
             #{ <<"size">> := Zero } when Zero =:= <<"0">> orelse Zero =:= 0 -> <<>>;
             BinData when is_binary(BinData) -> BinData;
             _ ->
-                {ok, Bytes} = data(ExpectedID, Opts),
-                Bytes
+                case data(ExpectedID, Opts) of
+                    {ok, Bytes} -> Bytes;
+                    _ -> <<>>
+                end
         end,
     DataSize = byte_size(Data),
     ?event(gateway, {data, {id, ExpectedID}, {data, Data}, {item, Item}}, Opts),
